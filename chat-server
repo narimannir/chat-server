@@ -1,0 +1,487 @@
+import socket
+import threading
+from datetime import datetime
+
+HOST = "0.0.0.0"
+PORT = 7787
+BUFFER_SIZE = 1024
+
+ADMIN_USERNAME = "NiR"
+ADMIN_PASSWORD = "7787"
+
+clients = {}  # client_socket -> {"username": str, "addr": tuple, "is_admin": bool}
+banned_ips = set()
+lock = threading.Lock()
+server_running = True
+chat_enabled = True
+
+
+def log(message):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}")
+
+
+def safe_send(client, message):
+    try:
+        client.send((message + "\n").encode("utf-8"))
+        return True
+    except:
+        return False
+
+
+def get_username(client):
+    with lock:
+        info = clients.get(client)
+        return info["username"] if info else None
+
+
+def is_admin(client):
+    with lock:
+        info = clients.get(client)
+        return info["is_admin"] if info else False
+
+
+def get_client_by_username(username):
+    with lock:
+        for client, info in clients.items():
+            if info["username"].lower() == username.lower():
+                return client
+    return None
+
+
+def username_exists(username):
+    with lock:
+        for info in clients.values():
+            if info["username"].lower() == username.lower():
+                return True
+    return False
+
+
+def make_unique_username(username):
+    base = username
+    counter = 1
+    with lock:
+        existing_names = {info["username"].lower() for info in clients.values()}
+    while username.lower() in existing_names:
+        username = f"{base}_{counter}"
+        counter += 1
+    return username
+
+
+def list_users():
+    with lock:
+        if not clients:
+            return "No users online."
+        result = []
+        for info in clients.values():
+            name = info["username"]
+            ip = info["addr"][0]
+            role = " [ADMIN]" if info.get("is_admin") else ""
+            result.append(f"{name}{role} - {ip}")
+        return "\n".join(result)
+
+
+def broadcast(message, exclude_client=None):
+    dead_clients = []
+    with lock:
+        current_clients = list(clients.keys())
+
+    for client in current_clients:
+        if client != exclude_client:
+            if not safe_send(client, message):
+                dead_clients.append(client)
+
+    for client in dead_clients:
+        remove_client(client, notify=True)
+
+
+def remove_client(client, notify=True):
+    with lock:
+        info = clients.pop(client, None)
+
+    if info:
+        username = info["username"]
+        addr = info["addr"]
+        try:
+            client.close()
+        except:
+            pass
+        log(f"{username} disconnected from {addr}")
+        if notify:
+            broadcast(f"*** {username} left the chat ***", exclude_client=client)
+    else:
+        try:
+            client.close()
+        except:
+            pass
+
+
+def ban_ip(ip):
+    with lock:
+        banned_ips.add(ip)
+    log(f"IP banned: {ip}")
+
+
+def send_private(sender_client, target_username, text):
+    sender_name = get_username(sender_client)
+    target_client = get_client_by_username(target_username)
+
+    if not target_client:
+        safe_send(sender_client, f"User '{target_username}' not found.")
+        return
+
+    safe_send(target_client, f"[PRIVATE from {sender_name}] {text}")
+    safe_send(sender_client, f"[PRIVATE to {target_username}] {text}")
+
+
+def send_help(client):
+    help_text = [
+        "Available commands:",
+        "/users                -> list online users",
+        "/msg <user> <text>    -> send private message",
+        "/rename <newname>     -> change your username",
+        "/help                 -> show this help",
+        "/quit                 -> leave chat",
+    ]
+
+    if is_admin(client):
+        help_text.extend([
+            "",
+            "Admin commands:",
+            "/chat off            -> disable public chat",
+            "/chat on             -> enable public chat",
+            "/kick <username>     -> kick user and ban IP",
+            "/ban <username>      -> ban user's IP and disconnect them",
+        ])
+
+    safe_send(client, "\n".join(help_text))
+
+
+def rename_user(client, new_name):
+    new_name = new_name.strip()
+
+    if not new_name:
+        safe_send(client, "Username cannot be empty.")
+        return
+
+    if new_name == ADMIN_USERNAME:
+        safe_send(client, "This username is reserved.")
+        return
+
+    old_name = get_username(client)
+    unique_name = make_unique_username(new_name)
+
+    with lock:
+        if client in clients:
+            clients[client]["username"] = unique_name
+
+    safe_send(client, f"Your username is now '{unique_name}'")
+    broadcast(f"*** {old_name} is now known as {unique_name} ***", exclude_client=client)
+    log(f"{old_name} renamed to {unique_name}")
+
+
+def kick_and_ban_username(username, by_admin="ADMIN"):
+    target_client = get_client_by_username(username)
+    if not target_client:
+        return False, f"User '{username}' not found."
+
+    with lock:
+        info = clients.get(target_client)
+
+    if not info:
+        return False, f"User '{username}' not found."
+
+    if info.get("is_admin"):
+        return False, "You cannot kick/ban another admin."
+
+    target_ip = info["addr"][0]
+    target_name = info["username"]
+
+    ban_ip(target_ip)
+    safe_send(target_client, "You have been kicked and your IP has been banned by admin.")
+    remove_client(target_client, notify=True)
+    log(f"{by_admin} kicked and banned {target_name} ({target_ip})")
+    return True, f"User '{target_name}' kicked and IP '{target_ip}' banned."
+
+
+def handle_command(client, message):
+    global chat_enabled
+
+    if message == "/users":
+        safe_send(client, list_users())
+
+    elif message.startswith("/msg "):
+        parts = message.split(" ", 2)
+        if len(parts) < 3:
+            safe_send(client, "Usage: /msg <user> <text>")
+        else:
+            _, target_username, text = parts
+            send_private(client, target_username, text)
+
+    elif message.startswith("/rename "):
+        parts = message.split(" ", 1)
+        if len(parts) < 2:
+            safe_send(client, "Usage: /rename <newname>")
+        else:
+            rename_user(client, parts[1])
+
+    elif message == "/help":
+        send_help(client)
+
+    elif message == "/quit":
+        safe_send(client, "Goodbye!")
+        return False
+
+    elif is_admin(client) and message == "/chat off":
+        chat_enabled = False
+        broadcast("*** Chat has been disabled by admin. ***")
+        log("Chat disabled by admin")
+
+    elif is_admin(client) and message == "/chat on":
+        chat_enabled = True
+        broadcast("*** Chat has been enabled by admin. ***")
+        log("Chat enabled by admin")
+
+    elif is_admin(client) and message.startswith("/kick "):
+        parts = message.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            safe_send(client, "Usage: /kick <username>")
+        else:
+            success, result = kick_and_ban_username(parts[1].strip(), by_admin=get_username(client))
+            safe_send(client, result)
+
+    elif is_admin(client) and message.startswith("/ban "):
+        parts = message.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            safe_send(client, "Usage: /ban <username>")
+        else:
+            success, result = kick_and_ban_username(parts[1].strip(), by_admin=get_username(client))
+            safe_send(client, result)
+
+    else:
+        safe_send(client, "Unknown command. Type /help")
+    return True
+
+
+def receive_line(client):
+    try:
+        data = client.recv(BUFFER_SIZE)
+        if not data:
+            return None
+        return data.decode("utf-8", errors="ignore").strip()
+    except:
+        return None
+
+
+def receive_username(client, addr):
+    safe_send(client, "Enter your username:")
+    username = receive_line(client)
+
+    if username is None:
+        return None, False
+
+    if not username:
+        username = f"{addr[0]}_{addr[1]}"
+
+    is_user_admin = False
+
+    if username == ADMIN_USERNAME:
+        safe_send(client, "Enter admin password:")
+        password = receive_line(client)
+
+        if password is None:
+            return None, False
+
+        if password != ADMIN_PASSWORD:
+            safe_send(client, "Wrong admin password. Connection closed.")
+            return None, False
+
+        is_user_admin = True
+        log(f"Admin login successful from {addr}")
+        return username, True
+
+    username = make_unique_username(username)
+    return username, is_user_admin
+
+
+def handle_client(client, addr):
+    global chat_enabled
+
+    ip = addr[0]
+
+    with lock:
+        if ip in banned_ips:
+            safe_send(client, "Your IP is banned from this server.")
+            try:
+                client.close()
+            except:
+                pass
+            log(f"Blocked banned IP connection attempt from {addr}")
+            return
+
+    username = None
+
+    try:
+        result = receive_username(client, addr)
+        if not result or result[0] is None:
+            try:
+                client.close()
+            except:
+                pass
+            return
+
+        username, user_is_admin = result
+
+        with lock:
+            clients[client] = {
+                "username": username,
+                "addr": addr,
+                "is_admin": user_is_admin
+            }
+
+        log(f"{username} connected from {addr}")
+        role_text = " [ADMIN]" if user_is_admin else ""
+        safe_send(client, f"Welcome {username}{role_text}!")
+        send_help(client)
+        broadcast(f"*** {username}{role_text} joined the chat ***", exclude_client=client)
+
+        while True:
+            data = client.recv(BUFFER_SIZE)
+            if not data:
+                break
+
+            message = data.decode("utf-8", errors="ignore").strip()
+            if not message:
+                continue
+
+            if message.startswith("/"):
+                if not handle_command(client, message):
+                    break
+                continue
+
+            if not chat_enabled and not is_admin(client):
+                safe_send(client, "Chat is currently disabled by admin.")
+                continue
+
+            sender_name = get_username(client)
+            full_message = f"[{sender_name}] {message}"
+            log(full_message)
+            broadcast(full_message, exclude_client=client)
+
+    except Exception as e:
+        log(f"Error with client {addr}: {e}")
+
+    finally:
+        remove_client(client, notify=True)
+
+
+def admin_console(server_socket):
+    global server_running, chat_enabled
+
+    while server_running:
+        try:
+            command = input().strip()
+
+            if command == "/users":
+                print(list_users())
+
+            elif command == "/chat off":
+                chat_enabled = False
+                broadcast("*** Chat has been disabled by server admin. ***")
+                log("Chat disabled from server console")
+
+            elif command == "/chat on":
+                chat_enabled = True
+                broadcast("*** Chat has been enabled by server admin. ***")
+                log("Chat enabled from server console")
+
+            elif command.startswith("/kick "):
+                parts = command.split(" ", 1)
+                if len(parts) < 2 or not parts[1].strip():
+                    print("Usage: /kick <username>")
+                else:
+                    success, result = kick_and_ban_username(parts[1].strip(), by_admin="SERVER_CONSOLE")
+                    print(result)
+
+            elif command.startswith("/ban "):
+                parts = command.split(" ", 1)
+                if len(parts) < 2 or not parts[1].strip():
+                    print("Usage: /ban <username>")
+                else:
+                    success, result = kick_and_ban_username(parts[1].strip(), by_admin="SERVER_CONSOLE")
+                    print(result)
+
+            elif command.startswith("/msg "):
+                parts = command.split(" ", 2)
+                if len(parts) < 3:
+                    print("Usage: /msg <user> <text>")
+                else:
+                    _, target_username, text = parts
+                    target_client = get_client_by_username(target_username)
+                    if target_client:
+                        safe_send(target_client, f"[ADMIN] {text}")
+                        print(f"Message sent to {target_username}")
+                    else:
+                        print("User not found.")
+
+            elif command == "/shutdown":
+                log("Server shutting down...")
+                broadcast("*** Server is shutting down ***")
+                server_running = False
+
+                try:
+                    server_socket.close()
+                except:
+                    pass
+
+                with lock:
+                    current_clients = list(clients.keys())
+
+                for c in current_clients:
+                    try:
+                        c.close()
+                    except:
+                        pass
+
+                break
+
+            else:
+                broadcast(f"[SERVER ADMIN] {command}")
+
+        except Exception as e:
+            log(f"Admin console error: {e}")
+
+
+def start_server():
+    global server_running
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((HOST, PORT))
+    server.listen(100)
+
+    log(f"Server started on {HOST}:{PORT}")
+    log("Admin console commands:")
+    log("/users")
+    log("/chat off")
+    log("/chat on")
+    log("/kick <username>")
+    log("/ban <username>")
+    log("/msg <user> <text>")
+    log("/shutdown")
+
+    threading.Thread(target=admin_console, args=(server,), daemon=True).start()
+
+    while server_running:
+        try:
+            client, addr = server.accept()
+            threading.Thread(target=handle_client, args=(client, addr), daemon=True).start()
+        except OSError:
+            break
+        except Exception as e:
+            log(f"Accept error: {e}")
+
+    log("Server stopped.")
+
+
+if __name__ == "__main__":
+    start_server()
